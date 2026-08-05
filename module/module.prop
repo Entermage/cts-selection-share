@@ -1,0 +1,6 @@
+id=cts_share_zygisk
+name=CTS Selection Share (Zygisk)
+version=0.5.3
+versionCode=13
+author=CTS Share contributors
+description=Shares the selected Circle to Search bitmap on Google App 17.x, with LensImages fallback for 16.x. Uses the standard Zygisk API.

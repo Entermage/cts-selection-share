@@ -1,0 +1,7 @@
+/build/
+/build-java-check/
+/.cxx/
+/.tools/
+*.iml
+.idea/
+local.properties
