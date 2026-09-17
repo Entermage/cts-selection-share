@@ -21,6 +21,8 @@ jobs:
           java-version: '21'
 
       - uses: android-actions/setup-android@v4
+        with:
+          packages: ''
 
       - name: Install Android SDK packages
         shell: pwsh
