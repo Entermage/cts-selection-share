@@ -1,8 +1,10 @@
 package dev.ctsshare;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.Application;
 import android.content.ClipData;
+import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
@@ -14,6 +16,7 @@ import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -24,6 +27,8 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.Button;
@@ -39,8 +44,14 @@ import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class ShareBootstrap {
@@ -50,6 +61,9 @@ public final class ShareBootstrap {
     private static final long POLL_MS = 100L;
     private static final long FALLBACK_DELAY_MS = 48L;
     private static final long CACHE_FILE_TTL_MS = 10 * 60_000L;
+    private static final long DEBUG_LOG_FILE_BYTES = 32 * 1024L;
+    private static final long DEBUG_STATE_MIN_INTERVAL_MS = 250L;
+    private static final Object DEBUG_LOG_LOCK = new Object();
 
     private static final AtomicBoolean INITIALIZED = new AtomicBoolean(false);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -64,17 +78,33 @@ public final class ShareBootstrap {
     private static Class<?> cachedPeerClass;
     private static Method cachedNormalizedRegionMethod;
     private static Field cachedActiveRegionField;
-    private static Field[] cachedRectFields = new Field[0];
     private static final ArrayList<File> pendingShareFiles = new ArrayList<>();
     private static long lastPreDrawProbe;
+    private static int sourceTaskId = -1;
+    private static int currentCtsTaskId = -1;
+    private static WeakReference<Activity> newlyCreatedCtsActivity = new WeakReference<>(null);
+    private static WeakReference<Activity> backCallbackActivity = new WeakReference<>(null);
+    private static OnBackInvokedCallback backCallback;
+    private static WeakReference<Application> debugApplication = new WeakReference<>(null);
+    private static String regionProbeState = "not-probed";
+    private static String lastDebugState = "";
+    private static long lastDebugStateAt;
+    private static long recoveryUntilUptime;
+    private static long lastRecoveryProbeAt;
 
     private ShareBootstrap() {}
 
     public static void init(final Application application) {
         if (!INITIALIZED.compareAndSet(false, true)) return;
+        debugApplication = new WeakReference<>(application);
+        debugLog(application, "helper init pid=" + android.os.Process.myPid()
+                + " sdk=" + Build.VERSION.SDK_INT);
         MAIN.post(() -> {
             cleanupCacheDirectory(application);
             application.registerActivityLifecycleCallbacks(new Callbacks());
+            recoveryUntilUptime = SystemClock.uptimeMillis() + 30_000L;
+            Activity recovered = findResumedCtsActivity();
+            if (recovered != null) handleCtsActivityResumed(recovered, true);
             MAIN.post(POLLER);
             Log.i(TAG, "Lifecycle monitor registered");
         });
@@ -84,6 +114,13 @@ public final class ShareBootstrap {
         @Override public void run() {
             try {
                 Activity activity = currentActivity.get();
+                long now = SystemClock.uptimeMillis();
+                if (activity == null && now < recoveryUntilUptime &&
+                        now - lastRecoveryProbeAt >= 500L) {
+                    lastRecoveryProbeAt = now;
+                    activity = findResumedCtsActivity();
+                    if (activity != null) handleCtsActivityResumed(activity, true);
+                }
                 if (activity != null && isCtsActivity(activity)) {
                     Bitmap candidate = selectedBitmap(activity);
                     if (candidate != null && !candidate.isRecycled()) currentSelection = candidate;
@@ -92,7 +129,15 @@ public final class ShareBootstrap {
                             System.currentTimeMillis() - image.lastModified() <= MAX_IMAGE_AGE_MS;
                     boolean rememberedSelection = currentSelection != null &&
                             !currentSelection.isRecycled();
-                    if (rememberedSelection || freshFile) ensureButton(activity);
+                    // The selected crop can be fully visible before Google exposes
+                    // its Bitmap or writes LensImages. Treat the RegionView state as
+                    // independent evidence so the Share action is not skipped in
+                    // that window (or for selections that never expose a Bitmap).
+                    Rect activeRegion = selectedRegionOnScreen(activity);
+                    logProbeState(activity, candidate, image, freshFile, activeRegion);
+                    if (activeRegion != null || rememberedSelection || freshFile) {
+                        ensureButton(activity, activeRegion);
+                    }
                     else removeButton(activity);
                 }
             } catch (Throwable error) {
@@ -108,6 +153,55 @@ public final class ShareBootstrap {
         return name.contains("omnient") ||
                 name.contains("contextualsearch") ||
                 name.contains("lensient");
+    }
+
+    private static Activity findResumedCtsActivity() {
+        try {
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentMethod = activityThreadClass.getDeclaredMethod(
+                    "currentActivityThread");
+            currentMethod.setAccessible(true);
+            Object activityThread = currentMethod.invoke(null);
+            if (activityThread == null) return null;
+
+            Field activitiesField = activityThreadClass.getDeclaredField("mActivities");
+            activitiesField.setAccessible(true);
+            Object activities = activitiesField.get(activityThread);
+            if (!(activities instanceof Map)) return null;
+            for (Object record : ((Map<?, ?>) activities).values()) {
+                if (record == null) continue;
+                Field activityField = findField(record.getClass(), "activity");
+                if (activityField == null) continue;
+                Object value = activityField.get(record);
+                if (!(value instanceof Activity)) continue;
+                Activity activity = (Activity) value;
+                Field pausedField = findField(record.getClass(), "paused");
+                boolean resumed = pausedField != null ?
+                        !pausedField.getBoolean(record) :
+                        activity.getWindow().getDecorView().hasWindowFocus();
+                if (isCtsActivity(activity) && resumed &&
+                        !activity.isFinishing() && !activity.isDestroyed()) {
+                    debugLog("recovered already-resumed CTS class="
+                            + activity.getClass().getName() + " task="
+                            + activity.getTaskId());
+                    return activity;
+                }
+            }
+        } catch (Throwable error) {
+            debugLog("CTS recovery error " + Log.getStackTraceString(error));
+        }
+        return null;
+    }
+
+    private static Field findField(Class<?> sourceClass, String name) {
+        for (Class<?> type = sourceClass; type != null; type = type.getSuperclass()) {
+            try {
+                Field field = type.getDeclaredField(name);
+                field.setAccessible(true);
+                return field;
+            } catch (Throwable ignored) {}
+        }
+        return null;
     }
 
     private static File latestLensImage(Activity activity) {
@@ -169,7 +263,7 @@ public final class ShareBootstrap {
         return best;
     }
 
-    private static void ensureButton(Activity activity) {
+    private static void ensureButton(Activity activity, Rect activeRegion) {
         ViewGroup root = (ViewGroup) activity.getWindow().getDecorView();
         View existingInjected = root.findViewWithTag(BUTTON_TAG);
 
@@ -178,7 +272,6 @@ public final class ShareBootstrap {
         View actionRowView = actionRowId == 0 ? null : root.findViewById(actionRowId);
         ViewGroup actionRow = actionRowView instanceof ViewGroup ?
                 (ViewGroup) actionRowView : null;
-        Rect activeRegion = selectedRegionOnScreen(activity);
         TextView reference = findNativeActionReference(actionRow);
         if (reference != null && activeRegion == null) {
             actionRowMissingSince = 0L;
@@ -218,6 +311,7 @@ public final class ShareBootstrap {
             actionRow.addView(button, params);
             actionRow.post(() -> keepNativeActionMenuOnScreen(activity, actionRow));
             Log.i(TAG, "Share button joined lens_action_menu_buttons");
+            debugLog("button joined native row region=" + rectText(activeRegion));
             return;
         }
 
@@ -265,6 +359,7 @@ public final class ShareBootstrap {
         positionStandaloneShare(activity, button);
         button.post(() -> positionStandaloneShare(activity, button));
         Log.i(TAG, "Share button added to " + activity.getClass().getName());
+        debugLog("standalone button added region=" + rectText(activeRegion));
     }
 
     private static TextView findNativeActionReference(ViewGroup actionRow) {
@@ -364,8 +459,15 @@ public final class ShareBootstrap {
             int id = activity.getResources().getIdentifier(
                     "region_view", "id", activity.getPackageName());
             View regionView = id == 0 ? null : root.findViewById(id);
-            if (regionView == null || regionView.getWidth() <= 0 ||
-                    regionView.getHeight() <= 0) return null;
+            if (regionView == null) {
+                regionProbeState = "region-view-missing id=" + id;
+                return null;
+            }
+            if (regionView.getWidth() <= 0 || regionView.getHeight() <= 0) {
+                regionProbeState = "region-view-not-laid-out size="
+                        + regionView.getWidth() + "x" + regionView.getHeight();
+                return null;
+            }
 
             Object peer = null;
             if (cachedRegionViewClass != regionView.getClass()) {
@@ -375,39 +477,41 @@ public final class ShareBootstrap {
                 try {
                     cachedPeerMethod = regionView.getClass().getDeclaredMethod("a");
                     cachedPeerMethod.setAccessible(true);
-                } catch (Throwable ignored) {
-                    try {
-                        cachedPeerField = regionView.getClass().getDeclaredField("a");
-                        cachedPeerField.setAccessible(true);
-                    } catch (Throwable ignoredAgain) {}
-                }
+                } catch (Throwable ignored) {}
+                try {
+                    cachedPeerField = regionView.getClass().getDeclaredField("a");
+                    cachedPeerField.setAccessible(true);
+                } catch (Throwable ignored) {}
             }
             try {
                 if (cachedPeerMethod != null) peer = cachedPeerMethod.invoke(regionView);
-                else if (cachedPeerField != null) peer = cachedPeerField.get(regionView);
             } catch (Throwable ignored) {}
-            if (peer == null) return null;
+            try {
+                if (peer == null && cachedPeerField != null) {
+                    peer = cachedPeerField.get(regionView);
+                }
+            } catch (Throwable ignored) {}
+            if (peer == null) peer = findRegionPeer(regionView);
+            if (peer == null) {
+                regionProbeState = "peer-missing view=" + regionView.getClass().getName();
+                return null;
+            }
 
-            if (cachedPeerClass != peer.getClass()) cachePeerReflection(peer.getClass());
+            if (cachedPeerClass != peer.getClass()) {
+                cachePeerReflection(peer.getClass());
+                debugLog("region peer=" + peer.getClass().getName()
+                        + " activeField=" + memberName(cachedActiveRegionField)
+                        + " normalizedMethod=" + memberName(cachedNormalizedRegionMethod));
+            }
             boolean hasActiveRegion = false;
-            boolean hasPixelRegion = false;
             try {
                 hasActiveRegion = cachedActiveRegionField != null &&
                         cachedActiveRegionField.get(peer) != null;
             } catch (Throwable ignored) {}
-            for (Field field : cachedRectFields) {
-                try {
-                    Object value = field.get(peer);
-                    if (value instanceof RectF) {
-                        RectF rect = (RectF) value;
-                        if (!rect.isEmpty() &&
-                                (rect.width() > 1.05f || rect.height() > 1.05f)) {
-                            hasPixelRegion = true;
-                        }
-                    }
-                } catch (Throwable ignored) {}
+            if (!hasActiveRegion) {
+                regionProbeState = "active-region-missing peer=" + peer.getClass().getName();
+                return null;
             }
-            if (!hasActiveRegion || !hasPixelRegion) return null;
 
             RectF normalized = null;
             try {
@@ -415,8 +519,9 @@ public final class ShareBootstrap {
                         cachedNormalizedRegionMethod.invoke(peer);
                 if (value instanceof RectF) normalized = new RectF((RectF) value);
             } catch (Throwable ignored) {}
-            if (normalized == null) {
-                for (Method method : peer.getClass().getDeclaredMethods()) {
+            if (!validNormalizedRegion(normalized)) {
+                normalized = null;
+                for (Method method : allDeclaredMethods(peer.getClass())) {
                     if (method.getParameterTypes().length != 0 ||
                             method.getReturnType() != RectF.class) continue;
                     try {
@@ -430,7 +535,11 @@ public final class ShareBootstrap {
                     } catch (Throwable ignored) {}
                 }
             }
-            if (!validNormalizedRegion(normalized)) return null;
+            if (!validNormalizedRegion(normalized)) {
+                regionProbeState = "normalized-region-invalid method="
+                        + memberName(cachedNormalizedRegionMethod);
+                return null;
+            }
 
             int[] location = new int[2];
             regionView.getLocationOnScreen(location);
@@ -441,12 +550,111 @@ public final class ShareBootstrap {
                     location[1] + Math.round(normalized.bottom * regionView.getHeight()));
             Rect rootBounds = new Rect();
             root.getGlobalVisibleRect(rootBounds);
-            if (!result.intersect(rootBounds) || result.isEmpty()) return null;
+            if (!result.intersect(rootBounds) || result.isEmpty()) {
+                regionProbeState = "region-outside-window raw=" + result;
+                return null;
+            }
+            regionProbeState = "valid " + result.flattenToString();
             return result;
         } catch (Throwable error) {
             Log.e(TAG, "Unable to read selected region", error);
+            regionProbeState = "region-error " + error.getClass().getName();
+            debugLog("region exception " + Log.getStackTraceString(error));
             return null;
         }
+    }
+
+    private static void logProbeState(Activity activity, Bitmap bitmap, File image,
+            boolean freshFile, Rect activeRegion) {
+        try {
+            View root = activity.getWindow().getDecorView();
+            int rowId = activity.getResources().getIdentifier(
+                    "lens_action_menu_buttons", "id", activity.getPackageName());
+            View row = rowId == 0 ? null : root.findViewById(rowId);
+            View button = root.findViewWithTag(BUTTON_TAG);
+            String state = "probe region={" + regionProbeState + "}"
+                    + " bitmap=" + bitmapText(bitmap)
+                    + " lens=" + fileText(image)
+                    + " fresh=" + freshFile
+                    + " row=" + viewText(row)
+                    + " button=" + viewText(button)
+                    + " active=" + rectText(activeRegion);
+            long now = SystemClock.uptimeMillis();
+            if (!state.equals(lastDebugState) &&
+                    now - lastDebugStateAt >= DEBUG_STATE_MIN_INTERVAL_MS) {
+                lastDebugState = state;
+                lastDebugStateAt = now;
+                debugLog(state);
+            }
+        } catch (Throwable error) {
+            debugLog("probe logging error=" + error.getClass().getName());
+        }
+    }
+
+    private static String bitmapText(Bitmap bitmap) {
+        if (bitmap == null) return "none";
+        if (bitmap.isRecycled()) return "recycled";
+        return bitmap.getWidth() + "x" + bitmap.getHeight();
+    }
+
+    private static String fileText(File file) {
+        if (file == null) return "none";
+        return file.getName() + ":" + file.length() + ":" + file.lastModified();
+    }
+
+    private static String viewText(View view) {
+        if (view == null) return "none";
+        return view.getClass().getSimpleName() + ":vis=" + view.getVisibility()
+                + ":shown=" + view.isShown() + ":size="
+                + view.getWidth() + "x" + view.getHeight();
+    }
+
+    private static String rectText(Rect rect) {
+        return rect == null ? "none" : rect.flattenToString();
+    }
+
+    private static String memberName(Object member) {
+        if (member instanceof Field) return ((Field) member).getName();
+        if (member instanceof Method) return ((Method) member).getName();
+        return "none";
+    }
+
+    private static Object findRegionPeer(View regionView) {
+        for (Class<?> type = regionView.getClass(); type != null; type = type.getSuperclass()) {
+            for (Field field : type.getDeclaredFields()) {
+                if (Modifier.isStatic(field.getModifiers()) || field.getType().isPrimitive()) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    Object candidate = field.get(regionView);
+                    if (candidate != null && hasRegionField(candidate.getClass())) {
+                        cachedPeerField = field;
+                        return candidate;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        return null;
+    }
+
+    private static boolean hasRegionField(Class<?> peerClass) {
+        for (Class<?> type = peerClass; type != null; type = type.getSuperclass()) {
+            for (Field field : type.getDeclaredFields()) {
+                if (field.getType().getName().endsWith(".lens.view.region.Region")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static ArrayList<Method> allDeclaredMethods(Class<?> sourceClass) {
+        ArrayList<Method> methods = new ArrayList<>();
+        for (Class<?> type = sourceClass; type != null; type = type.getSuperclass()) {
+            for (Method method : type.getDeclaredMethods()) methods.add(method);
+        }
+        return methods;
     }
 
     private static boolean validNormalizedRegion(RectF value) {
@@ -460,23 +668,24 @@ public final class ShareBootstrap {
         cachedPeerClass = peerClass;
         cachedNormalizedRegionMethod = null;
         cachedActiveRegionField = null;
-        ArrayList<Field> rectFields = new ArrayList<>();
-        for (Field field : peerClass.getDeclaredFields()) {
+        for (Class<?> type = peerClass; type != null; type = type.getSuperclass()) {
+            for (Field field : type.getDeclaredFields()) {
+                try {
+                    field.setAccessible(true);
+                    String typeName = field.getType().getName();
+                    if (typeName.endsWith(".lens.view.region.Region")) {
+                        cachedActiveRegionField = field;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+        for (Class<?> type = peerClass; type != null; type = type.getSuperclass()) {
             try {
-                field.setAccessible(true);
-                String typeName = field.getType().getName();
-                if (typeName.endsWith(".lens.view.region.Region")) {
-                    cachedActiveRegionField = field;
-                } else if (field.getType() == RectF.class) {
-                    rectFields.add(field);
-                }
+                cachedNormalizedRegionMethod = type.getDeclaredMethod("c");
+                cachedNormalizedRegionMethod.setAccessible(true);
+                break;
             } catch (Throwable ignored) {}
         }
-        cachedRectFields = rectFields.toArray(new Field[rectFields.size()]);
-        try {
-            cachedNormalizedRegionMethod = peerClass.getDeclaredMethod("c");
-            cachedNormalizedRegionMethod.setAccessible(true);
-        } catch (Throwable ignored) {}
     }
 
     private static void keepNativeActionMenuOnScreen(Activity activity, View actionRow) {
@@ -516,21 +725,25 @@ public final class ShareBootstrap {
             try {
                 Activity current = currentActivity.get();
                 Bitmap selection = currentSelection;
+                boolean hasSelectionBitmap = selection != null && !selection.isRecycled();
                 long now = SystemClock.uptimeMillis();
                 if (current == activity &&
-                        (selection == null || root.findViewWithTag(BUTTON_TAG) == null) &&
+                        (!hasSelectionBitmap || root.findViewWithTag(BUTTON_TAG) == null) &&
                         now - lastPreDrawProbe >= 32L) {
                     lastPreDrawProbe = now;
                     Bitmap candidate = selectedBitmap(activity);
                     if (candidate != null && !candidate.isRecycled()) {
                         currentSelection = candidate;
                         selection = candidate;
+                        hasSelectionBitmap = true;
                     }
                 }
-                if (current == activity && selection != null && !selection.isRecycled()) {
+                Rect activeRegion = current == activity ?
+                        selectedRegionOnScreen(activity) : null;
+                if (current == activity && (hasSelectionBitmap || activeRegion != null)) {
                     View before = root.findViewWithTag(BUTTON_TAG);
                     Object beforeParent = before == null ? null : before.getParent();
-                    ensureButton(activity);
+                    ensureButton(activity, activeRegion);
                     // If Google rebuilt the action row, cancel this draw once so
                     // the user never sees a frame containing only Select text.
                     View after = root.findViewWithTag(BUTTON_TAG);
@@ -587,6 +800,7 @@ public final class ShareBootstrap {
         View button = root.findViewWithTag(BUTTON_TAG);
         if (button != null && button.getParent() instanceof ViewGroup) {
             ((ViewGroup) button.getParent()).removeView(button);
+            debugLog("button removed region={" + regionProbeState + "}");
         }
     }
 
@@ -596,7 +810,10 @@ public final class ShareBootstrap {
             selected = currentSelection;
         }
         File image = latestLensImage(activity);
+        debugLog("share clicked bitmap=" + bitmapText(selected)
+                + " lens=" + fileText(image) + " region={" + regionProbeState + "}");
         if (selected == null && image == null) {
+            debugLog("share rejected: no image");
             Toast.makeText(activity, noImageLabel(), Toast.LENGTH_SHORT).show();
             return;
         }
@@ -619,6 +836,8 @@ public final class ShareBootstrap {
             MAIN.post(() -> {
                 button.setEnabled(true);
                 if (uri == null || activity.isFinishing()) {
+                    debugLog("share prepare failed uri=" + uri
+                            + " finishing=" + activity.isFinishing());
                     Toast.makeText(activity, shareFailedLabel(), Toast.LENGTH_SHORT).show();
                     return;
                 }
@@ -629,7 +848,14 @@ public final class ShareBootstrap {
                 send.putExtra(Intent.EXTRA_STREAM, uri);
                 send.setClipData(ClipData.newUri(activity.getContentResolver(), "CTS image", uri));
                 send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                activity.startActivity(Intent.createChooser(send, shareLabel()));
+                try {
+                    activity.startActivity(Intent.createChooser(send, shareLabel()));
+                    debugLog("system sharesheet started mime=" + mime);
+                } catch (Throwable error) {
+                    Log.e(TAG, "Unable to open sharesheet", error);
+                    Toast.makeText(activity, shareFailedLabel(), Toast.LENGTH_SHORT).show();
+                    debugLog("sharesheet exception " + Log.getStackTraceString(error));
+                }
             });
         }, "CTSShareCopy").start();
     }
@@ -765,31 +991,186 @@ public final class ShareBootstrap {
         return Math.round(value * activity.getResources().getDisplayMetrics().density);
     }
 
+    private static void debugLog(String message) {
+        Application application = debugApplication.get();
+        if (application != null) debugLog(application, message);
+    }
+
+    private static void debugLog(Context context, String message) {
+        synchronized (DEBUG_LOG_LOCK) {
+            try {
+                File current = new File(context.getFilesDir(), "cts-share-debug.log");
+                File previous = new File(context.getFilesDir(), "cts-share-debug.log.1");
+                if (current.length() >= DEBUG_LOG_FILE_BYTES) {
+                    if (previous.exists() && !previous.delete()) {
+                        Log.w(TAG, "Unable to delete old debug log");
+                    }
+                    if (!current.renameTo(previous)) {
+                        try (FileOutputStream truncate = new FileOutputStream(current, false)) {
+                            truncate.write(new byte[0]);
+                        }
+                    }
+                }
+                String timestamp = new SimpleDateFormat(
+                        "yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
+                String line = timestamp + " " + message.replace('\n', ' ') + "\n";
+                try (FileOutputStream output = new FileOutputStream(current, true)) {
+                    output.write(line.getBytes(StandardCharsets.UTF_8));
+                }
+            } catch (Throwable error) {
+                Log.e(TAG, "Unable to write debug log", error);
+            }
+        }
+    }
+
+    private static void rememberSourceTask(Activity activity) {
+        try {
+            ActivityManager manager = (ActivityManager)
+                    activity.getSystemService(Context.ACTIVITY_SERVICE);
+            if (manager == null) return;
+            int ctsTaskId = activity.getTaskId();
+            List<ActivityManager.RunningTaskInfo> tasks = manager.getRunningTasks(12);
+            for (ActivityManager.RunningTaskInfo task : tasks) {
+                int taskId = task.taskId;
+                if (taskId >= 0 && taskId != ctsTaskId && !isCtsTask(task)) {
+                    sourceTaskId = taskId;
+                    Log.i(TAG, "Remembered source task=" + sourceTaskId);
+                    return;
+                }
+            }
+            sourceTaskId = -1;
+            Log.w(TAG, "No source task found behind CTS task=" + ctsTaskId);
+        } catch (Throwable error) {
+            sourceTaskId = -1;
+            Log.e(TAG, "Unable to remember source task", error);
+        }
+    }
+
+    private static boolean isCtsTask(ActivityManager.RunningTaskInfo task) {
+        ComponentName component = task.topActivity != null ? task.topActivity : task.baseActivity;
+        if (component == null) return false;
+        String name = component.getClassName().toLowerCase(Locale.US);
+        return name.contains("omnient") ||
+                name.contains("contextualsearch") ||
+                name.contains("lensient");
+    }
+
+    private static void returnToSource(Activity activity) {
+        int targetTaskId = sourceTaskId;
+        boolean restored = false;
+        try {
+            ActivityManager manager = (ActivityManager)
+                    activity.getSystemService(Context.ACTIVITY_SERVICE);
+            if (manager != null && targetTaskId >= 0) {
+                manager.moveTaskToFront(targetTaskId, 0);
+                restored = true;
+            }
+        } catch (Throwable error) {
+            Log.e(TAG, "Unable to restore source task=" + targetTaskId, error);
+        }
+        if (!restored) {
+            restored = activity.moveTaskToBack(true);
+        }
+        sourceTaskId = -1;
+        currentCtsTaskId = -1;
+        Log.i(TAG, "Returned to source task=" + targetTaskId
+                + " restored=" + restored);
+    }
+
+    private static void installBackCallback(Activity activity) {
+        if (Build.VERSION.SDK_INT < 33 || backCallbackActivity.get() == activity) return;
+        clearBackCallback();
+        try {
+            OnBackInvokedCallback callback = () -> returnToSource(activity);
+            activity.getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_OVERLAY, callback);
+            backCallback = callback;
+            backCallbackActivity = new WeakReference<>(activity);
+            Log.i(TAG, "CTS back callback registered");
+        } catch (Throwable error) {
+            Log.e(TAG, "Unable to register CTS back callback", error);
+        }
+    }
+
+    private static void clearBackCallback() {
+        Activity activity = backCallbackActivity.get();
+        OnBackInvokedCallback callback = backCallback;
+        backCallbackActivity = new WeakReference<>(null);
+        backCallback = null;
+        if (Build.VERSION.SDK_INT < 33 || activity == null || callback == null) return;
+        try {
+            activity.getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(callback);
+        } catch (Throwable error) {
+            Log.w(TAG, "Unable to unregister CTS back callback", error);
+        }
+    }
+
+    private static void handleCtsActivityResumed(Activity activity, boolean recovered) {
+        Activity previous = currentActivity.get();
+        if (previous != activity) {
+            currentSelection = null;
+            actionRowMissingSince = 0L;
+        }
+        currentActivity = new WeakReference<>(activity);
+        int taskId = activity.getTaskId();
+        boolean newCtsLaunch = newlyCreatedCtsActivity.get() == activity;
+        if (newCtsLaunch) newlyCreatedCtsActivity = new WeakReference<>(null);
+        if (sourceTaskId < 0 || newCtsLaunch) {
+            currentCtsTaskId = taskId;
+            int previousSourceTaskId = sourceTaskId;
+            rememberSourceTask(activity);
+            if (newCtsLaunch && previousSourceTaskId >= 0) {
+                Log.i(TAG, "New CTS launch replaced source task="
+                        + previousSourceTaskId + " with task=" + sourceTaskId);
+            }
+        } else if (taskId != currentCtsTaskId) {
+            currentCtsTaskId = taskId;
+            Log.i(TAG, "CTS task changed; preserved source task=" + sourceTaskId);
+        }
+        installBackCallback(activity);
+        installPreDrawGuard(activity);
+        Log.i(TAG, "CTS candidate resumed: " + activity.getClass().getName());
+        debugLog("activity bound class=" + activity.getClass().getName()
+                + " task=" + taskId + " source=" + sourceTaskId
+                + " newLaunch=" + newCtsLaunch + " recovered=" + recovered);
+    }
+
     private static final class Callbacks implements Application.ActivityLifecycleCallbacks {
-        @Override public void onActivityCreated(Activity activity, Bundle state) {}
+        @Override public void onActivityCreated(Activity activity, Bundle state) {
+            if (isCtsActivity(activity) && state == null) {
+                newlyCreatedCtsActivity = new WeakReference<>(activity);
+                debugLog("activity created class=" + activity.getClass().getName()
+                        + " task=" + activity.getTaskId() + " fresh=true");
+            } else if (isCtsActivity(activity)) {
+                debugLog("activity created class=" + activity.getClass().getName()
+                        + " task=" + activity.getTaskId() + " restored=true");
+            }
+        }
         @Override public void onActivityStarted(Activity activity) {}
 
         @Override public void onActivityResumed(Activity activity) {
             if (isCtsActivity(activity)) {
-                Activity previous = currentActivity.get();
-                if (previous != activity) {
-                    currentSelection = null;
-                    actionRowMissingSince = 0L;
-                }
-                currentActivity = new WeakReference<>(activity);
-                installPreDrawGuard(activity);
-                Log.i(TAG, "CTS candidate resumed: " + activity.getClass().getName());
+                handleCtsActivityResumed(activity, false);
             }
         }
 
         @Override public void onActivityPaused(Activity activity) {
             // Keep the injected child while the system sharesheet is on top.
             // Google's Select text action also remains attached during pause.
+            if (isCtsActivity(activity)) {
+                debugLog("activity paused class=" + activity.getClass().getName()
+                        + " task=" + activity.getTaskId());
+            }
         }
 
         @Override public void onActivityStopped(Activity activity) {}
         @Override public void onActivitySaveInstanceState(Activity activity, Bundle state) {}
         @Override public void onActivityDestroyed(Activity activity) {
+            if (isCtsActivity(activity)) {
+                debugLog("activity destroyed class=" + activity.getClass().getName()
+                        + " task=" + activity.getTaskId());
+            }
+            if (backCallbackActivity.get() == activity) clearBackCallback();
             Activity current = currentActivity.get();
             if (current == activity) {
                 removeButton(activity);
