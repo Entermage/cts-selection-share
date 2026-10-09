@@ -7,6 +7,7 @@ API. It shares the selected crop with the Android system sharesheet.
 
 Android 11+, arm64-v8a, Google App 17.x, and a Zygisk API v4 implementation.
 Limited fallback support is included for Google App 16.x.
+KernelSU/ReSukiSU requires a Zygisk implementation such as Zygisk Next.
 
 Tested on OnePlus 15 with Android 16 and Pixel 10 Pro Fold with Android 17.
 

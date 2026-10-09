@@ -8,6 +8,7 @@ import android.content.ComponentName;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Bitmap;
 import android.graphics.Rect;
@@ -15,6 +16,7 @@ import android.graphics.RectF;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -348,7 +350,13 @@ public final class ShareBootstrap {
         GradientDrawable background = new GradientDrawable();
         background.setColor(Color.argb(235, 43, 43, 43));
         background.setCornerRadius(dp(activity, 24));
-        button.setBackground(background);
+        // A plain TextView has no themed press feedback. Keep the existing capsule
+        // and let Android handle the ripple, including release and drag cancellation.
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(Color.WHITE);
+        mask.setCornerRadius(dp(activity, 24));
+        button.setBackground(new RippleDrawable(
+                ColorStateList.valueOf(Color.argb(48, 255, 255, 255)), background, mask));
         button.setOnClickListener(view -> shareLatest(activity, button));
 
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(

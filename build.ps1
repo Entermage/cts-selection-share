@@ -4,6 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $project 'scripts\module-package.ps1')
 if ([string]::IsNullOrWhiteSpace($NdkPath)) {
     $NdkPath = Join-Path (Split-Path -Parent $project) "ndk-r29\android-ndk-r29"
 }
@@ -68,8 +69,8 @@ $ndkArgs = @(
 & $ndkBuild $ndkArgs
 if ($LASTEXITCODE -ne 0) { throw "ndk-build failed" }
 
-Copy-Item -LiteralPath $moduleProp -Destination $stage
-Copy-Item -LiteralPath (Join-Path $project "module\customize.sh") -Destination $stage
+Write-ModuleTextFile $moduleProp (Join-Path $stage 'module.prop')
+Write-ModuleTextFile (Join-Path $project 'module\customize.sh') (Join-Path $stage 'customize.sh')
 Copy-Item -LiteralPath (Join-Path $dexOut "classes.dex") -Destination (Join-Path $stage "helper.dex")
 New-Item -ItemType File -Force -Path (Join-Path $stage "skip_mount") | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stage "zygisk") | Out-Null
@@ -78,4 +79,5 @@ Copy-Item -LiteralPath (Join-Path $nativeOut "libs\arm64-v8a\libctsshare.so") `
 
 & tar.exe -a -c -f $zipPath -C $stage zygisk customize.sh helper.dex module.prop skip_mount
 if ($LASTEXITCODE -ne 0) { throw "zip packaging failed" }
+Assert-ModulePackage $zipPath
 Write-Host "Built: $zipPath"
